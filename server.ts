@@ -12,27 +12,44 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Validate environment variables
-const requiredEnv = ["SUPABASE_URL", "SUPABASE_ANON_KEY", "DATABASE_URL", "JWT_SECRET"];
-const missingEnv = requiredEnv.filter((env) => !process.env[env]);
-if (missingEnv.length > 0) {
-  console.error(`❌ Erro: Variáveis de ambiente faltando: ${missingEnv.join(", ")}`);
+// Validate environment variables (supporting VITE_ prefix)
+const getEnv = (key: string) => process.env[`VITE_${key}`] || process.env[key];
+
+const SUPABASE_URL = getEnv("SUPABASE_URL");
+const SUPABASE_ANON_KEY = getEnv("SUPABASE_ANON_KEY");
+const DATABASE_URL = getEnv("DATABASE_URL");
+const JWT_SECRET = getEnv("JWT_SECRET") || "super-secret-key";
+
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !DATABASE_URL) {
+  console.error(`❌ Erro: Variáveis de ambiente faltando (SUPABASE_URL, SUPABASE_ANON_KEY ou DATABASE_URL)`);
   process.exit(1);
 }
 
 // Supabase client
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_ANON_KEY!
-);
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // Database connection
-const sql = postgres(process.env.DATABASE_URL!, {
+const sql = postgres(DATABASE_URL, {
   ssl: 'require',
   max: 10,
   idle_timeout: 20,
   connect_timeout: 10,
 });
+
+// Test database connection
+async function checkConnection() {
+  try {
+    await sql`SELECT 1`;
+    console.log("✅ Conexão com o banco de dados (Postgres) estabelecida com sucesso.");
+  } catch (err: any) {
+    console.error("❌ Erro crítico: Não foi possível conectar ao banco de dados Postgres.");
+    console.error("Detalhes do erro:", err.message);
+    // Não encerramos o processo aqui para permitir que o Vite sirva o frontend, 
+    // mas as APIs de banco falharão com mensagens claras.
+  }
+}
+
+checkConnection();
 
 const JWT_SECRET = process.env.JWT_SECRET || "super-secret-key";
 
@@ -68,6 +85,10 @@ async function startServer() {
   app.post("/api/auth/login", async (req, res) => {
     const { email, senha } = req.body;
     try {
+      if (!email || !senha) {
+        return res.status(400).json({ error: "E-mail e senha são obrigatórios" });
+      }
+
       // 1. Authenticate with Supabase Auth
       const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
         email,
@@ -75,35 +96,53 @@ async function startServer() {
       });
 
       if (authError) {
+        // Retorna o erro real do Supabase (ex: "Invalid login credentials" ou "Email not confirmed")
         return res.status(401).json({ error: authError.message });
       }
 
       // 2. Fetch user from 'usuarios' table
-      const [user] = await sql`SELECT * FROM usuarios WHERE email = ${email}`;
+      // Buscamos todas as colunas para garantir flexibilidade (id, nome, email, perfil, status)
+      const users = await sql`SELECT * FROM usuarios WHERE email = ${email}`;
+      const user = users[0];
 
       if (!user) {
-        return res.status(401).json({ error: "Usuário não encontrado na base de dados do sistema. Entre em contato com o administrador." });
+        return res.status(401).json({ 
+          error: "Usuário autenticado, mas não encontrado na tabela 'usuarios'. Verifique se o e-mail está cadastrado no banco de dados." 
+        });
       }
 
       // 3. Validate status
       if (user.status !== 'ativo') {
-        return res.status(403).json({ error: "Sua conta está inativa. Acesso bloqueado." });
+        return res.status(403).json({ error: "Sua conta está inativa. Acesso bloqueado pelo administrador." });
       }
 
-      // 4. Generate JWT
+      // 4. Validate profile
+      if (user.perfil !== 'admin' && user.perfil !== 'usuario') {
+        return res.status(403).json({ error: "Perfil de usuário inválido ou não configurado no banco de dados." });
+      }
+
+      // 5. Generate JWT
       const token = jwt.sign(
-        { id: user.id, email: user.email, perfil: user.perfil, nome: user.nome },
+        { 
+          id: user.id || user.email, // Usa ID se existir, senão usa email como identificador
+          email: user.email, 
+          perfil: user.perfil, 
+          nome: user.nome 
+        },
         JWT_SECRET,
         { expiresIn: "24h" }
       );
 
       res.json({
         token,
-        user: { id: user.id, email: user.email, nome: user.nome, perfil: user.perfil }
+        user: { email: user.email, nome: user.nome, perfil: user.perfil }
       });
     } catch (err: any) {
-      console.error("Login error:", err);
-      res.status(500).json({ error: `Erro no login: ${err.message || "Erro interno no servidor"}` });
+      console.error("Login error details:", err);
+      // Retorna o erro real do banco ou do servidor
+      res.status(500).json({ 
+        error: `Erro no servidor: ${err.message || "Erro desconhecido durante o processamento do login"}` 
+      });
     }
   });
 
